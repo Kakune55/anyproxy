@@ -19,9 +19,9 @@ var requestCounter int64
 
 func main() {
 
-	flag.Parse()
 	port := flag.Int("port", 8080, "代理服务器监听的端口")
 	debug := flag.Bool("debug", false, "是否启用调试模式")
+	flag.Parse()
 
 	if *debug {
 		gin.SetMode(gin.DebugMode) // 启用调试模式
