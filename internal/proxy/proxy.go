@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"anyproxy/internal/metrics"
 	"anyproxy/internal/middleware"
 )
 
@@ -83,6 +84,9 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	}
 	defer resp.Body.Close()
 
+	// 仅在真正进行了一次上游转发并得到响应后计数
+	metrics.Inc()
+
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	isSSE := mediaType == "text/event-stream"
 
@@ -137,7 +141,9 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 
 // HelloPage 返回简单状态页面
 func HelloPage(c *gin.Context) {
-	count := totalForwarded.Load()
+	count := metrics.Total()
+	qps := metrics.QPS()
+	qpm := metrics.QPM()
 
 	// 推断外部可见协议与主机（支持反向代理常见头）
 	scheme := "http"
@@ -152,7 +158,7 @@ func HelloPage(c *gin.Context) {
 	}
 	base := scheme + "://" + host
 
-	str := fmt.Sprintf("AnyProxy 服务器正在运行... 已转发 %d 个请求", count)
+	str := fmt.Sprintf("AnyProxy 服务器正在运行...\n累计转发(不含本页): %d\n当前QPS: %d\n最近1分钟QPM: %d", count, qps, qpm)
 	str += "\n\n使用方法:\n"
 	str += "方式1 - 直接协议路径: \n"
 	str += fmt.Sprintf("  目标URL: https://example.com/path --> 代理URL: %s/https/example.com/path\n", base)

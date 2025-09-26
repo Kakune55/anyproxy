@@ -61,6 +61,7 @@ func main() {
 	r.Use(middleware.Recovery(logger), middleware.RequestID(), middleware.Logger(logger))
 
 	r.GET("/", proxy.HelloPage) // 欢迎页面
+	r.GET("/metrics", middleware.MetricsHandler) // 指标接口
 	r.Any("/proxy/*proxyPath", p.HandleProxyPath) // 处理 /proxy/*path 形式的请求
 	r.Any(":protocol/*remainder", p.HandleProtocol) // 处理 /:protocol/*remainder 形式的请求
 
