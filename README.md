@@ -50,7 +50,8 @@ WantedBy=multi-user.target
 | 参数     | 是否可选 |      默认值       | 数据类型 | 解释                              |
 | -------- | -------: | :---------------: | -------- | --------------------------------- |
 | -port    |       是 |       8080        | int      | 代理服务器监听端口                |
-| -debug   |       是 |       false       | bool     | 调试模式（debug 级别日志）        |
+| -debug   |       是 |       false       | bool     | 调试模式（等价于未指定 -log-level 时将日志等级提升为 debug） |
+| -log-level |    是 |       warn        | string   | 日志等级: debug / info / warn / error |
 | -log     |       是 | （输出到 stderr） | string   | 日志文件路径（默认输出到 stderr） |
 | -grace   |       是 |        10         | int      | 优雅停机等待秒数                  |
 | -timeout |       是 |         0         | int      | 单次上游请求超时秒（0 = 不设置）  |

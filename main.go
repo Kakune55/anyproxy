@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,9 +23,21 @@ import (
 func main() {
 	cfg := config.Parse()
 
-	// 日志初始化设置
+	// 日志初始化设置 (支持显式日志等级)
 	levelVar := new(slog.LevelVar)
-	if cfg.Debug { levelVar.Set(slog.LevelDebug) } else { levelVar.Set(slog.LevelInfo) }
+	lvlStr := strings.ToLower(cfg.LogLevel)
+	switch lvlStr {
+	case "debug":
+		levelVar.Set(slog.LevelDebug)
+	case "info":
+		levelVar.Set(slog.LevelInfo)
+	case "warn", "warning":
+		levelVar.Set(slog.LevelWarn)
+	case "error", "err":
+		levelVar.Set(slog.LevelError)
+	default:
+		levelVar.Set(slog.LevelWarn) // 回退到默认 warn
+	}
 	var writer io.Writer = os.Stderr
 	if cfg.LogFile != "" {
 		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -35,7 +48,7 @@ func main() {
 	logger := slog.New(h)
 	slog.SetDefault(logger)
 
-	if cfg.Debug { gin.SetMode(gin.DebugMode) } else { gin.SetMode(gin.ReleaseMode) }
+	if cfg.Debug || lvlStr == "debug" { gin.SetMode(gin.DebugMode) } else { gin.SetMode(gin.ReleaseMode) }
 
 	// 可复用的 HTTP 客户端（保持连接复用）
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DisableCompression: true}
@@ -51,7 +64,7 @@ func main() {
 	r.Any("/proxy/*proxyPath", p.HandleProxyPath) // 处理 /proxy/*path 形式的请求
 	r.Any(":protocol/*remainder", p.HandleProtocol) // 处理 /:protocol/*remainder 形式的请求
 
-	logger.Info("服务器启动", "addr", cfg.Addr(), "debug", cfg.Debug, "version", version.Version, "commit", version.GitCommit)
+	logger.Info("服务器启动", "addr", cfg.Addr(), "debug", cfg.Debug, "log_level", lvlStr, "version", version.Version, "commit", version.GitCommit)
 
 	// 优雅停机设置：监听系统信号，执行平滑关闭
 	srv := &http.Server{Addr: cfg.Addr(), Handler: r}
