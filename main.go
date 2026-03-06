@@ -50,8 +50,16 @@ func main() {
 
 	if cfg.Debug || lvlStr == "debug" { gin.SetMode(gin.DebugMode) } else { gin.SetMode(gin.ReleaseMode) }
 
-	// 可复用的 HTTP 客户端（保持连接复用）
-	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, DisableCompression: true}
+	// 可复用的 HTTP 客户端
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          512,
+		MaxIdleConnsPerHost:   128,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 	client := &http.Client{Transport: transport}
 	if cfg.RequestTimeout > 0 { client.Timeout = time.Duration(cfg.RequestTimeout) * time.Second }
 

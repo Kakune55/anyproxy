@@ -38,14 +38,17 @@ func BuildFromProtocol(protocol, remainder string, originalQuery url.Values) (st
 func mergeQuery(raw string, original url.Values) (string, error) {
 	parsed, err := url.Parse(raw)
 	if err != nil { return "", err }
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("不支持的协议")
+	}
+	if parsed.Host == "" {
+		return "", errors.New("目标地址无效")
+	}
 	// 合并 query
 	q := parsed.Query()
 	for k, vs := range original {
 		for _, v := range vs { q.Add(k, v) }
 	}
 	parsed.RawQuery = q.Encode()
-	if _, err := url.ParseRequestURI(parsed.String()); err != nil {
-		return "", err
-	}
 	return parsed.String(), nil
 }

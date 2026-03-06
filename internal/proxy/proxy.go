@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"mime"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +19,10 @@ import (
 
 // 转发的总请求计数器
 var totalForwarded atomic.Int64
+
+var copyBufPool = sync.Pool{
+	New: func() any { return make([]byte, 32*1024) },
+}
 
 // Proxy 封装具体的转发逻辑
 type Proxy struct {
@@ -73,8 +77,10 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		return
 	}
 	upReq.Header = c.Request.Header.Clone()
-
-	// 仅在 SSE 时禁用压缩；稍后检测
+	if strings.Contains(strings.ToLower(c.GetHeader("Accept")), "text/event-stream") {
+		// SSE 禁用压缩
+		upReq.Header.Del("Accept-Encoding")
+	}
 
 	resp, err := p.Client.Do(upReq)
 	if err != nil {
@@ -87,15 +93,14 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	// 仅在真正进行了一次上游转发并得到响应后计数
 	metrics.Inc()
 
-	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-	isSSE := mediaType == "text/event-stream"
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	isSSE := strings.HasPrefix(contentType, "text/event-stream")
 
 	p.Log.Debug("上游响应", "req_id", reqID, "status", resp.StatusCode, "sse", isSSE)
 
-	// 复制上游响应头（最小化过滤）
-	for k, vs := range resp.Header {
-		for _, v := range vs { c.Header(k, v) }
-	}
+	// 复制上游响应头
+	dstHeader := c.Writer.Header()
+	for k, vs := range resp.Header { dstHeader[k] = vs }
 	if isSSE {
 		c.Writer.Header().Del("Content-Length")
 		c.Writer.Header().Del("Transfer-Encoding")
@@ -103,14 +108,15 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("X-Accel-Buffering", "no")
-		// 确保禁用上游压缩避免 SSE 事件被聚合
-		upReq.Header.Del("Accept-Encoding")
 	}
 	c.Status(resp.StatusCode)
 	if f, ok := c.Writer.(http.Flusher); ok { f.Flush() }
 
 	if !isSSE {
-		if _, err := io.Copy(c.Writer, resp.Body); err != nil {
+		buf := copyBufPool.Get().([]byte)
+		_, err := io.CopyBuffer(c.Writer, resp.Body, buf)
+		copyBufPool.Put(buf)
+		if err != nil {
 			p.Log.Error("写入响应体失败", "req_id", reqID, "error", err)
 		}
 		return

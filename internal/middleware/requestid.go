@@ -1,7 +1,7 @@
 package middleware
 
 import (
-	"fmt"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/gin-gonic/gin"
@@ -16,7 +16,7 @@ func RequestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := globalReqID.Add(1)
 		c.Set(RequestIDKey, id)
-		c.Writer.Header().Set("X-Request-ID", fmt.Sprintf("%d", id))
+		c.Writer.Header().Set("X-Request-ID", strconv.FormatInt(id, 10))
 		c.Next()
 	}
 }
