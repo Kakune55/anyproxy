@@ -8,7 +8,6 @@ import (
 	"anyproxy/internal/metrics"
 )
 
-// MetricsHandler 输出当前指标
 func MetricsHandler(c *gin.Context) {
 	qps := metrics.QPS()
 	qpm := metrics.QPM()

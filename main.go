@@ -23,7 +23,6 @@ import (
 func main() {
 	cfg := config.Parse()
 
-	// 日志初始化设置 (支持显式日志等级)
 	levelVar := new(slog.LevelVar)
 	lvlStr := strings.ToLower(cfg.LogLevel)
 	switch lvlStr {
@@ -36,7 +35,7 @@ func main() {
 	case "error", "err":
 		levelVar.Set(slog.LevelError)
 	default:
-		levelVar.Set(slog.LevelWarn) // 回退到默认 warn
+		levelVar.Set(slog.LevelWarn)
 	}
 	var writer io.Writer = os.Stderr
 	if cfg.LogFile != "" {
@@ -56,7 +55,6 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// 可复用的 HTTP 客户端
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		ForceAttemptHTTP2:     true,
@@ -76,14 +74,13 @@ func main() {
 	r := gin.New()
 	r.Use(middleware.Recovery(logger), middleware.RequestID(), middleware.Logger(logger))
 
-	r.GET("/", proxy.HelloPage)                     // 欢迎页面
-	r.GET("/metrics", middleware.MetricsHandler)    // 指标接口
-	r.Any("/proxy/*proxyPath", p.HandleProxyPath)   // 处理 /proxy/*path 形式的请求
-	r.Any(":protocol/*remainder", p.HandleProtocol) // 处理 /:protocol/*remainder 形式的请求
+	r.GET("/", proxy.HelloPage)
+	r.GET("/metrics", middleware.MetricsHandler)
+	r.Any("/proxy/*proxyPath", p.HandleProxyPath)
+	r.Any(":protocol/*remainder", p.HandleProtocol)
 
 	logger.Info("服务器启动", "addr", cfg.Addr(), "debug", cfg.Debug, "log_level", lvlStr, "version", version.Version, "commit", version.GitCommit)
 
-	// 优雅停机设置：监听系统信号，执行平滑关闭
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
 		Handler:           r,

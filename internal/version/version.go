@@ -3,7 +3,7 @@ package version
 import "runtime/debug"
 
 var (
-	Version   = "1.1.0-rc"
+	Version   = "1.1.1-rc"
 	GitCommit = ""
 	BuildInfo = ""
 )

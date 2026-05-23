@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -24,7 +25,6 @@ import (
 	"anyproxy/internal/middleware"
 )
 
-// 转发的总请求计数器
 var totalForwarded atomic.Int64
 
 var copyBufPool = sync.Pool{
@@ -232,7 +232,6 @@ func prepareUpstreamBody(req *http.Request) (io.ReadCloser, func() (io.ReadClose
 	}, nil, false, req.ContentLength, nil
 }
 
-// Proxy 封装具体的转发逻辑
 type Proxy struct {
 	Client *http.Client
 	Log    *slog.Logger
@@ -242,7 +241,6 @@ func New(client *http.Client, logger *slog.Logger) *Proxy {
 	return &Proxy{Client: client, Log: logger}
 }
 
-// HandleProxyPath 处理 /proxy/*path 形式的请求
 func (p *Proxy) HandleProxyPath(c *gin.Context) {
 	urlStr, err := BuildFromProxyPath(c.Param("proxyPath"), c.Request.URL.Query())
 	if err != nil {
@@ -252,7 +250,6 @@ func (p *Proxy) HandleProxyPath(c *gin.Context) {
 	p.forward(c, urlStr)
 }
 
-// HandleProtocol 处理 /:protocol/*remainder 形式的请求
 func (p *Proxy) HandleProtocol(c *gin.Context) {
 	urlStr, err := BuildFromProtocol(c.Param("protocol"), c.Param("remainder"), c.Request.URL.Query())
 	if err != nil {
@@ -287,7 +284,6 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		return
 	}
 
-	// 基于原始上下文创建上游请求（支持客户端断开时取消）
 	upReq, err := http.NewRequestWithContext(ctx, c.Request.Method, target, body)
 	if err != nil {
 		p.Log.Error("创建上游请求失败", "req_id", reqID, "error", err)
@@ -301,7 +297,6 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	upReq.Header = c.Request.Header.Clone()
 	removeHopByHopHeaders(upReq.Header)
 	if strings.Contains(strings.ToLower(c.GetHeader("Accept")), "text/event-stream") {
-		// SSE 禁用压缩
 		upReq.Header.Del("Accept-Encoding")
 	}
 
@@ -324,7 +319,6 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	}
 	defer resp.Body.Close()
 
-	// 仅在真正进行了一次上游转发并得到响应后计数
 	metrics.Inc()
 
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
@@ -338,11 +332,8 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		p.Log.Debug("上游响应", attrs...)
 	}
 
-	// 复制上游响应头
 	dstHeader := c.Writer.Header()
-	for k, vs := range resp.Header {
-		dstHeader[k] = vs
-	}
+	maps.Copy(dstHeader, resp.Header)
 	removeHopByHopHeaders(dstHeader)
 	if isSSE {
 		c.Writer.Header().Del("Content-Length")
@@ -392,19 +383,16 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	}
 }
 
-// HelloPage 返回简单状态页面
 func HelloPage(c *gin.Context) {
 	count := metrics.Total()
 	qps := metrics.QPS()
 	qpm := metrics.QPM()
 
-	// 推断外部可见协议与主机（支持反向代理常见头）
 	scheme := "http"
 	if c.Request.TLS != nil {
 		scheme = "https"
 	}
 	if xf := c.GetHeader("X-Forwarded-Proto"); xf != "" {
-		// 取第一个
 		scheme = strings.TrimSpace(strings.Split(xf, ",")[0])
 	}
 	host := c.Request.Host
@@ -413,7 +401,7 @@ func HelloPage(c *gin.Context) {
 	}
 	base := scheme + "://" + host
 
-	str := fmt.Sprintf("AnyProxy 服务器正在运行...\n累计转发(不含本页): %d\n当前QPS: %d\n最近1分钟QPM: %d", count, qps, qpm)
+	str := fmt.Sprintf("AnyProxy 正在运行...\n累计转发: %d\n当前QPS: %d\n最近1分钟QPM: %d", count, qps, qpm)
 	str += "\n\n使用方法:\n"
 	str += "方式1 - 直接协议路径: \n"
 	str += fmt.Sprintf("  目标URL: https://example.com/path --> 代理URL: %s/https/example.com/path\n", base)

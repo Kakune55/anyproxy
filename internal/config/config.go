@@ -5,17 +5,15 @@ import (
 	"fmt"
 )
 
-// Config 保存程序配置
 type Config struct {
-	Port          int
-	Debug         bool
-	LogFile       string
-	ShutdownGrace int // 优雅停机等待秒数
-	RequestTimeout int // 上游整体请求超时时间（秒）
-	LogLevel      string // 日志等级: debug|info|warn|error
+	Port           int
+	Debug          bool
+	LogFile        string
+	ShutdownGrace  int
+	RequestTimeout int
+	LogLevel       string
 }
 
-// Parse 解析命令行参数返回配置
 func Parse() *Config {
 	cfg := &Config{}
 	flag.IntVar(&cfg.Port, "port", 8080, "代理服务器监听端口")
@@ -27,7 +25,9 @@ func Parse() *Config {
 	flag.Parse()
 
 	// 兼容旧的 -debug 参数: 当 -debug 为 true 且未显式指定其它日志等级(仍为默认 warn) 时，提升为 debug
-	if cfg.Debug && cfg.LogLevel == "warn" { cfg.LogLevel = "debug" }
+	if cfg.Debug && cfg.LogLevel == "warn" {
+		cfg.LogLevel = "debug"
+	}
 	return cfg
 }
 
