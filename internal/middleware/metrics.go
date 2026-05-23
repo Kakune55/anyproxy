@@ -1,17 +1,18 @@
 package middleware
 
 import (
+	"encoding/json"
+	"net/http"
 	"time"
-
-	"github.com/gin-gonic/gin"
 
 	"anyproxy/internal/metrics"
 )
 
-func MetricsHandler(c *gin.Context) {
+func MetricsHandler(w http.ResponseWriter, _ *http.Request) {
 	qps := metrics.QPS()
 	qpm := metrics.QPM()
-	c.JSON(200, gin.H{
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"qps_current": qps,
 		"qps_avg_60s": float64(qpm) / 60.0,
 		"qpm_current": qpm,

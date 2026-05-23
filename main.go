@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/lmittmann/tint"
 
 	"anyproxy/internal/config"
@@ -45,15 +44,9 @@ func main() {
 		}
 		writer = io.MultiWriter(os.Stderr, f)
 	}
-	h := tint.NewHandler(writer, &tint.Options{AddSource: true, Level: levelVar, TimeFormat: "2006-01-02 15:04:05"})
+	h := tint.NewHandler(writer, &tint.Options{AddSource: cfg.LogSource, Level: levelVar, TimeFormat: "2006-01-02 15:04:05"})
 	logger := slog.New(h)
 	slog.SetDefault(logger)
-
-	if cfg.Debug || lvlStr == "debug" {
-		gin.SetMode(gin.DebugMode)
-	} else {
-		gin.SetMode(gin.ReleaseMode)
-	}
 
 	transport := &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -69,21 +62,24 @@ func main() {
 		client.Timeout = time.Duration(cfg.RequestTimeout) * time.Second
 	}
 
-	p := proxy.New(client, logger)
+	p := proxy.New(client, logger, cfg.ReplayBodyLimitBytes())
 
-	r := gin.New()
-	r.Use(middleware.Recovery(logger), middleware.RequestID(), middleware.Logger(logger))
+	handler := buildHandler(p, logger, cfg.AccessLog)
 
-	r.GET("/", proxy.HelloPage)
-	r.GET("/metrics", middleware.MetricsHandler)
-	r.Any("/proxy/*proxyPath", p.HandleProxyPath)
-	r.Any(":protocol/*remainder", p.HandleProtocol)
-
-	logger.Info("服务器启动", "addr", cfg.Addr(), "debug", cfg.Debug, "log_level", lvlStr, "version", version.Version, "commit", version.GitCommit)
+	logger.Info("服务器启动",
+		"addr", cfg.Addr(),
+		"debug", cfg.Debug,
+		"log_level", lvlStr,
+		"log_source", cfg.LogSource,
+		"access_log", cfg.AccessLog,
+		"replay_body_limit_mib", cfg.ReplayBodyLimitMiB,
+		"version", version.Version,
+		"commit", version.GitCommit,
+	)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
-		Handler:           r,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20,
@@ -105,4 +101,29 @@ func main() {
 	} else {
 		logger.Info("关闭完成")
 	}
+}
+
+func buildHandler(p *proxy.Proxy, logger *slog.Logger, accessLog bool) http.Handler {
+	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/":
+			proxy.HelloPage(w, r)
+		case r.URL.Path == "/metrics":
+			middleware.MetricsHandler(w, r)
+		case strings.HasPrefix(r.URL.Path, "/proxy/"):
+			p.HandleProxyPath(w, r, strings.TrimPrefix(r.URL.Path, "/proxy/"))
+		default:
+			protocol, remainder, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			p.HandleProtocol(w, r, protocol, "/"+remainder)
+		}
+	})
+
+	handler = middleware.Recovery(logger)(handler)
+	handler = middleware.Logger(logger, accessLog)(handler)
+	handler = middleware.RequestID(handler)
+	return handler
 }

@@ -10,8 +10,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gin-gonic/gin"
-
 	"anyproxy/internal/middleware"
 )
 
@@ -21,17 +19,19 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func newTestRouter(client *http.Client) *gin.Engine {
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	p := New(client, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	r.Use(middleware.RequestID())
-	r.Any("/proxy/*proxyPath", p.HandleProxyPath)
-	return r
+func newTestHandler(client *http.Client) http.Handler {
+	p := New(client, slog.New(slog.NewTextHandler(io.Discard, nil)), DefaultReplayBodyLimitBytes)
+	return middleware.RequestID(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/proxy/") {
+			http.NotFound(w, r)
+			return
+		}
+		p.HandleProxyPath(w, r, strings.TrimPrefix(r.URL.Path, "/proxy/"))
+	}))
 }
 
 func TestProxyGeneratedErrorIncludesSource(t *testing.T) {
-	r := newTestRouter(&http.Client{
+	h := newTestHandler(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return nil, io.ErrUnexpectedEOF
 		}),
@@ -39,7 +39,7 @@ func TestProxyGeneratedErrorIncludesSource(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/proxy/https://example.com/test", nil)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
@@ -61,7 +61,7 @@ func TestProxyGeneratedErrorIncludesSource(t *testing.T) {
 }
 
 func TestUpstream5xxIsProxiedWithoutAnyProxySource(t *testing.T) {
-	r := newTestRouter(&http.Client{
+	h := newTestHandler(&http.Client{
 		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusBadGateway,
@@ -73,7 +73,7 @@ func TestUpstream5xxIsProxiedWithoutAnyProxySource(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/proxy/https://example.com/test", nil)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadGateway)
@@ -88,7 +88,7 @@ func TestUpstream5xxIsProxiedWithoutAnyProxySource(t *testing.T) {
 
 func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
 	var upstreamReqHeader http.Header
-	r := newTestRouter(&http.Client{
+	h := newTestHandler(&http.Client{
 		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			upstreamReqHeader = req.Header.Clone()
 			return &http.Response{
@@ -112,7 +112,7 @@ func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
 	req.Header.Set("X-Keep-Me", "ok")
 
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, req)
 
 	if got := upstreamReqHeader.Get("X-Client-Remove"); got != "" {
 		t.Fatalf("request hop-by-hop extension forwarded: %q", got)
@@ -137,7 +137,7 @@ func TestHopByHopHeadersAreNotForwarded(t *testing.T) {
 func TestPrepareUpstreamBodySmallBodyIsReplayable(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello"))
 
-	body, getBody, replayable, contentLength, err := prepareUpstreamBody(req)
+	body, getBody, replayable, contentLength, err := prepareUpstreamBody(req, DefaultReplayBodyLimitBytes)
 	if err != nil {
 		t.Fatalf("prepare body: %v", err)
 	}
@@ -161,9 +161,9 @@ func TestPrepareUpstreamBodySmallBodyIsReplayable(t *testing.T) {
 
 func TestPrepareUpstreamBodyLargeKnownLengthStaysStreaming(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/", io.NopCloser(bytes.NewReader([]byte("stream"))))
-	req.ContentLength = maxReplayBodyBytes + 1
+	req.ContentLength = DefaultReplayBodyLimitBytes + 1
 
-	body, getBody, replayable, contentLength, err := prepareUpstreamBody(req)
+	body, getBody, replayable, contentLength, err := prepareUpstreamBody(req, DefaultReplayBodyLimitBytes)
 	if err != nil {
 		t.Fatalf("prepare body: %v", err)
 	}
@@ -174,10 +174,30 @@ func TestPrepareUpstreamBodyLargeKnownLengthStaysStreaming(t *testing.T) {
 	if getBody != nil {
 		t.Fatal("large body should not have GetBody")
 	}
-	if contentLength != maxReplayBodyBytes+1 {
-		t.Fatalf("contentLength = %d, want %d", contentLength, maxReplayBodyBytes+1)
+	if contentLength != DefaultReplayBodyLimitBytes+1 {
+		t.Fatalf("contentLength = %d, want %d", contentLength, DefaultReplayBodyLimitBytes+1)
 	}
 	assertReadAll(t, body, "stream")
+}
+
+func TestPrepareUpstreamBodyDisabledReplayStaysStreaming(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader("hello"))
+
+	body, getBody, replayable, contentLength, err := prepareUpstreamBody(req, 0)
+	if err != nil {
+		t.Fatalf("prepare body: %v", err)
+	}
+
+	if replayable {
+		t.Fatal("body should not be replayable when replay limit is disabled")
+	}
+	if getBody != nil {
+		t.Fatal("disabled replay should not have GetBody")
+	}
+	if contentLength != 5 {
+		t.Fatalf("contentLength = %d, want 5", contentLength)
+	}
+	assertReadAll(t, body, "hello")
 }
 
 func assertReadAll(t *testing.T, r io.ReadCloser, want string) {

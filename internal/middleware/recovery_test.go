@@ -7,21 +7,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/gin-gonic/gin"
 )
 
 func TestRecoveryErrorIncludesSource(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	r.Use(RequestID(), Recovery(slog.New(slog.NewTextHandler(io.Discard, nil))))
-	r.GET("/panic", func(*gin.Context) {
+	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		panic("boom")
 	})
+	handler := RequestID(Recovery(slog.New(slog.NewTextHandler(io.Discard, nil)))(h))
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/panic", nil)
-	r.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)

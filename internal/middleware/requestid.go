@@ -1,30 +1,27 @@
 package middleware
 
 import (
+	"context"
+	"net/http"
 	"strconv"
 	"sync/atomic"
-
-	"github.com/gin-gonic/gin"
 )
 
-const RequestIDKey = "reqID"
+type requestIDKey struct{}
 
 var globalReqID atomic.Int64
 
-func RequestID() gin.HandlerFunc {
-	return func(c *gin.Context) {
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := globalReqID.Add(1)
-		c.Set(RequestIDKey, id)
-		c.Writer.Header().Set("X-Request-ID", strconv.FormatInt(id, 10))
-		c.Next()
-	}
+		w.Header().Set("X-Request-ID", strconv.FormatInt(id, 10))
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+	})
 }
 
-func GetReqID(c *gin.Context) int64 {
-	if v, ok := c.Get(RequestIDKey); ok {
-		if id, ok2 := v.(int64); ok2 {
-			return id
-		}
+func GetReqID(r *http.Request) int64 {
+	if id, ok := r.Context().Value(requestIDKey{}).(int64); ok {
+		return id
 	}
 	return 0
 }

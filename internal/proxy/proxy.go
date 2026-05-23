@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +20,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gin-gonic/gin"
-
 	"anyproxy/internal/metrics"
 	"anyproxy/internal/middleware"
 )
@@ -31,7 +30,7 @@ var copyBufPool = sync.Pool{
 	New: func() any { return make([]byte, 32*1024) },
 }
 
-const maxReplayBodyBytes int64 = 8 << 20
+const DefaultReplayBodyLimitBytes int64 = 8 << 20
 
 var hopByHopHeaders = []string{
 	"Connection",
@@ -203,20 +202,20 @@ func classifyUpstreamError(ctx context.Context, err error) string {
 	return "upstream_error"
 }
 
-func prepareUpstreamBody(req *http.Request) (io.ReadCloser, func() (io.ReadCloser, error), bool, int64, error) {
+func prepareUpstreamBody(req *http.Request, limit int64) (io.ReadCloser, func() (io.ReadCloser, error), bool, int64, error) {
 	if req.Body == nil || req.Body == http.NoBody {
 		return http.NoBody, nil, false, 0, nil
 	}
-	if req.ContentLength > maxReplayBodyBytes {
+	if limit <= 0 || req.ContentLength > limit {
 		return req.Body, nil, false, req.ContentLength, nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(req.Body, maxReplayBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(req.Body, limit+1))
 	if err != nil {
 		return nil, nil, false, 0, err
 	}
 
-	if int64(len(body)) <= maxReplayBodyBytes {
+	if int64(len(body)) <= limit {
 		if err := req.Body.Close(); err != nil {
 			return nil, nil, false, 0, err
 		}
@@ -233,70 +232,83 @@ func prepareUpstreamBody(req *http.Request) (io.ReadCloser, func() (io.ReadClose
 }
 
 type Proxy struct {
-	Client *http.Client
-	Log    *slog.Logger
+	Client          *http.Client
+	Log             *slog.Logger
+	ReplayBodyLimit int64
 }
 
-func New(client *http.Client, logger *slog.Logger) *Proxy {
-	return &Proxy{Client: client, Log: logger}
+func New(client *http.Client, logger *slog.Logger, replayBodyLimit int64) *Proxy {
+	return &Proxy{Client: client, Log: logger, ReplayBodyLimit: replayBodyLimit}
 }
 
-func (p *Proxy) HandleProxyPath(c *gin.Context) {
-	urlStr, err := BuildFromProxyPath(c.Param("proxyPath"), c.Request.URL.Query())
+func (p *Proxy) HandleProxyPath(w http.ResponseWriter, r *http.Request, pathPart string) {
+	urlStr, err := BuildFromProxyPath(pathPart, r.URL.Query())
 	if err != nil {
-		p.writeError(c, http.StatusBadRequest, err)
+		p.writeError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	p.forward(c, urlStr)
+	p.forward(w, r, urlStr)
 }
 
-func (p *Proxy) HandleProtocol(c *gin.Context) {
-	urlStr, err := BuildFromProtocol(c.Param("protocol"), c.Param("remainder"), c.Request.URL.Query())
+func (p *Proxy) HandleProtocol(w http.ResponseWriter, r *http.Request, protocol, remainder string) {
+	urlStr, err := BuildFromProtocol(protocol, remainder, r.URL.Query())
 	if err != nil {
-		p.writeError(c, http.StatusBadRequest, err)
+		p.writeError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	p.forward(c, urlStr)
+	p.forward(w, r, urlStr)
 }
 
-func (p *Proxy) writeError(c *gin.Context, code int, err error) {
-	c.JSON(code, gin.H{"error": err.Error(), "req_id": middleware.GetReqID(c), "source": "anyproxy"})
+type errorResponse struct {
+	Error  string `json:"error"`
+	ReqID  int64  `json:"req_id"`
+	Source string `json:"source"`
 }
 
-func (p *Proxy) forward(c *gin.Context, target string) {
-	reqID := middleware.GetReqID(c)
+func (p *Proxy) writeError(w http.ResponseWriter, r *http.Request, code int, err error) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(errorResponse{
+		Error:  err.Error(),
+		ReqID:  middleware.GetReqID(r),
+		Source: "anyproxy",
+	})
+}
+
+func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string) {
+	reqID := middleware.GetReqID(r)
 	current := totalForwarded.Add(1)
 	p.Log.Debug("开始转发请求",
 		"req_id", reqID,
 		"count", current,
-		"method", c.Request.Method,
+		"method", r.Method,
 		"target", target,
-		"uri", c.Request.RequestURI,
+		"uri", r.RequestURI,
 	)
 
 	trace := newUpstreamTrace()
-	ctx := httptrace.WithClientTrace(c.Request.Context(), trace.clientTrace())
+	ctx := httptrace.WithClientTrace(r.Context(), trace.clientTrace())
 
-	body, getBody, bodyReplayable, contentLength, err := prepareUpstreamBody(c.Request)
+	body, getBody, bodyReplayable, contentLength, err := prepareUpstreamBody(r, p.ReplayBodyLimit)
 	if err != nil {
 		p.Log.Error("读取请求体失败", "req_id", reqID, "error", err)
-		p.writeError(c, http.StatusBadRequest, errors.New("读取请求体失败"))
+		p.writeError(w, r, http.StatusBadRequest, errors.New("读取请求体失败"))
 		return
 	}
 
-	upReq, err := http.NewRequestWithContext(ctx, c.Request.Method, target, body)
+	upReq, err := http.NewRequestWithContext(ctx, r.Method, target, body)
 	if err != nil {
 		p.Log.Error("创建上游请求失败", "req_id", reqID, "error", err)
-		p.writeError(c, http.StatusInternalServerError, errors.New("创建上游请求失败"))
+		p.writeError(w, r, http.StatusInternalServerError, errors.New("创建上游请求失败"))
 		return
 	}
 	upReq.GetBody = getBody
 	if getBody != nil {
 		upReq.ContentLength = contentLength
 	}
-	upReq.Header = c.Request.Header.Clone()
+	upReq.Header = r.Header.Clone()
 	removeHopByHopHeaders(upReq.Header)
-	if strings.Contains(strings.ToLower(c.GetHeader("Accept")), "text/event-stream") {
+	if strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/event-stream") {
 		upReq.Header.Del("Accept-Encoding")
 	}
 
@@ -304,17 +316,17 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	if err != nil {
 		attrs := []any{
 			"req_id", reqID,
-			"method", c.Request.Method,
+			"method", r.Method,
 			"upstream_scheme", upReq.URL.Scheme,
 			"upstream_host", upReq.URL.Host,
 			"body_replayable", bodyReplayable,
 			"phase", trace.phase(),
-			"category", classifyUpstreamError(c.Request.Context(), err),
+			"category", classifyUpstreamError(r.Context(), err),
 			"error", err,
 		}
 		attrs = append(attrs, trace.attrs()...)
 		p.Log.Error("上游请求失败", attrs...)
-		p.writeError(c, http.StatusBadGateway, errors.New("上游请求失败"))
+		p.writeError(w, r, http.StatusBadGateway, errors.New("上游请求失败"))
 		return
 	}
 	defer resp.Body.Close()
@@ -332,25 +344,25 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		p.Log.Debug("上游响应", attrs...)
 	}
 
-	dstHeader := c.Writer.Header()
+	dstHeader := w.Header()
 	maps.Copy(dstHeader, resp.Header)
 	removeHopByHopHeaders(dstHeader)
 	if isSSE {
-		c.Writer.Header().Del("Content-Length")
-		c.Writer.Header().Del("Transfer-Encoding")
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Header("Connection", "keep-alive")
-		c.Header("X-Accel-Buffering", "no")
+		dstHeader.Del("Content-Length")
+		dstHeader.Del("Transfer-Encoding")
+		dstHeader.Set("Content-Type", "text/event-stream")
+		dstHeader.Set("Cache-Control", "no-cache")
+		dstHeader.Set("Connection", "keep-alive")
+		dstHeader.Set("X-Accel-Buffering", "no")
 	}
-	c.Status(resp.StatusCode)
-	if f, ok := c.Writer.(http.Flusher); ok {
+	w.WriteHeader(resp.StatusCode)
+	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
 
 	if !isSSE {
 		buf := copyBufPool.Get().([]byte)
-		_, err := io.CopyBuffer(c.Writer, resp.Body, buf)
+		_, err := io.CopyBuffer(w, resp.Body, buf)
 		copyBufPool.Put(buf)
 		if err != nil {
 			p.Log.Error("写入响应体失败", "req_id", reqID, "error", err)
@@ -359,7 +371,6 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	}
 
 	reader := bufio.NewReader(resp.Body)
-	w := c.Writer
 	flusher, _ := w.(http.Flusher)
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -383,20 +394,20 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	}
 }
 
-func HelloPage(c *gin.Context) {
+func HelloPage(w http.ResponseWriter, r *http.Request) {
 	count := metrics.Total()
 	qps := metrics.QPS()
 	qpm := metrics.QPM()
 
 	scheme := "http"
-	if c.Request.TLS != nil {
+	if r.TLS != nil {
 		scheme = "https"
 	}
-	if xf := c.GetHeader("X-Forwarded-Proto"); xf != "" {
+	if xf := r.Header.Get("X-Forwarded-Proto"); xf != "" {
 		scheme = strings.TrimSpace(strings.Split(xf, ",")[0])
 	}
-	host := c.Request.Host
-	if xfh := c.GetHeader("X-Forwarded-Host"); xfh != "" {
+	host := r.Host
+	if xfh := r.Header.Get("X-Forwarded-Host"); xfh != "" {
 		host = strings.TrimSpace(strings.Split(xfh, ",")[0])
 	}
 	base := scheme + "://" + host
@@ -411,5 +422,7 @@ func HelloPage(c *gin.Context) {
 	str += fmt.Sprintf("  目标URL: http://example.com  --> 代理URL: %s/proxy/http://example.com\n\n", base)
 	str += "目标URL必须以 https:// 或 http:// 开头。\n\n"
 	str += fmt.Sprintf("本机访问基地址: %s\n", base)
-	c.String(200, str)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, str)
 }

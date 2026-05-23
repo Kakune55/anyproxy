@@ -53,5 +53,8 @@ WantedBy=multi-user.target
 | -debug   |       是 |       false       | bool     | 调试模式（等价于未指定 -log-level 时将日志等级提升为 debug） |
 | -log-level |    是 |       warn        | string   | 日志等级: debug / info / warn / error |
 | -log     |       是 | （输出到 stderr） | string   | 日志文件路径（默认输出到 stderr） |
+| -log-source |    是 |       false       | bool     | 日志中记录源码位置                |
+| -access-log |    是 |       true        | bool     | 记录每个 HTTP 请求的访问日志      |
 | -grace   |       是 |        10         | int      | 优雅停机等待秒数                  |
 | -timeout |       是 |         0         | int      | 单次上游请求超时秒（0 = 不设置）  |
+| -replay-body-limit | 是 |        8          | int      | 可重放上游请求体上限 MiB（0 = 禁用） |
