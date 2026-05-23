@@ -20,8 +20,9 @@ func Recovery(logger *slog.Logger) gin.HandlerFunc {
 					"path", c.Request.URL.Path,
 				)
 				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
-					"error": "内部服务器错误",
+					"error":  "内部服务器错误",
 					"req_id": GetReqID(c),
+					"source": "anyproxy",
 				})
 			}
 		}()

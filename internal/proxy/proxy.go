@@ -2,14 +2,21 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -22,6 +29,207 @@ var totalForwarded atomic.Int64
 
 var copyBufPool = sync.Pool{
 	New: func() any { return make([]byte, 32*1024) },
+}
+
+const maxReplayBodyBytes int64 = 8 << 20
+
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Proxy-Connection",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+type readCloser struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *readCloser) Close() error {
+	return r.closer.Close()
+}
+
+func removeHopByHopHeaders(h http.Header) {
+	for _, header := range h.Values("Connection") {
+		for _, f := range strings.Split(header, ",") {
+			if f = strings.TrimSpace(f); f != "" {
+				h.Del(f)
+			}
+		}
+	}
+	for _, header := range hopByHopHeaders {
+		h.Del(header)
+	}
+}
+
+type upstreamTrace struct {
+	start             time.Time
+	dnsStart          time.Time
+	dnsDone           time.Time
+	connectStart      time.Time
+	connectDone       time.Time
+	tlsStart          time.Time
+	tlsDone           time.Time
+	wroteRequest      time.Time
+	firstResponseByte time.Time
+	reusedConn        bool
+}
+
+func newUpstreamTrace() *upstreamTrace {
+	return &upstreamTrace{start: time.Now()}
+}
+
+func (t *upstreamTrace) clientTrace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		DNSStart: func(httptrace.DNSStartInfo) {
+			t.dnsStart = time.Now()
+		},
+		DNSDone: func(httptrace.DNSDoneInfo) {
+			t.dnsDone = time.Now()
+		},
+		ConnectStart: func(_, _ string) {
+			t.connectStart = time.Now()
+		},
+		ConnectDone: func(_, _ string, _ error) {
+			t.connectDone = time.Now()
+		},
+		TLSHandshakeStart: func() {
+			t.tlsStart = time.Now()
+		},
+		TLSHandshakeDone: func(tls.ConnectionState, error) {
+			t.tlsDone = time.Now()
+		},
+		GotConn: func(info httptrace.GotConnInfo) {
+			t.reusedConn = info.Reused
+		},
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			t.wroteRequest = time.Now()
+		},
+		GotFirstResponseByte: func() {
+			t.firstResponseByte = time.Now()
+		},
+	}
+}
+
+func (t *upstreamTrace) attrs() []any {
+	attrs := []any{
+		"upstream_total_ms", time.Since(t.start).Milliseconds(),
+		"upstream_reused_conn", t.reusedConn,
+	}
+	if !t.dnsStart.IsZero() && !t.dnsDone.IsZero() {
+		attrs = append(attrs, "upstream_dns_ms", t.dnsDone.Sub(t.dnsStart).Milliseconds())
+	}
+	if !t.connectStart.IsZero() && !t.connectDone.IsZero() {
+		attrs = append(attrs, "upstream_connect_ms", t.connectDone.Sub(t.connectStart).Milliseconds())
+	}
+	if !t.tlsStart.IsZero() && !t.tlsDone.IsZero() {
+		attrs = append(attrs, "upstream_tls_ms", t.tlsDone.Sub(t.tlsStart).Milliseconds())
+	}
+	if !t.wroteRequest.IsZero() {
+		attrs = append(attrs, "upstream_to_write_req_ms", t.wroteRequest.Sub(t.start).Milliseconds())
+	}
+	if !t.firstResponseByte.IsZero() {
+		attrs = append(attrs, "upstream_to_first_byte_ms", t.firstResponseByte.Sub(t.start).Milliseconds())
+	}
+	return attrs
+}
+
+func (t *upstreamTrace) phase() string {
+	switch {
+	case !t.firstResponseByte.IsZero():
+		return "reading_response"
+	case !t.wroteRequest.IsZero():
+		return "waiting_first_byte"
+	case !t.tlsStart.IsZero() && t.tlsDone.IsZero():
+		return "tls_handshake"
+	case !t.connectStart.IsZero() && t.connectDone.IsZero():
+		return "tcp_connect"
+	case !t.dnsStart.IsZero() && t.dnsDone.IsZero():
+		return "dns_lookup"
+	default:
+		return "before_request_sent"
+	}
+}
+
+func classifyUpstreamError(ctx context.Context, err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return "client_canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "deadline_exceeded"
+	}
+
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		if dnsErr.IsTimeout {
+			return "dns_timeout"
+		}
+		if dnsErr.IsNotFound {
+			return "dns_not_found"
+		}
+		return "dns_error"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "network_timeout"
+	}
+
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if opErr.Op != "" {
+			return opErr.Op + "_error"
+		}
+		return "network_error"
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Op != "" {
+		if strings.Contains(urlErr.Err.Error(), "http2: Transport: cannot retry") {
+			return "http2_retry_body_unavailable"
+		}
+		return urlErr.Op + "_error"
+	}
+
+	if strings.Contains(err.Error(), "http2: Transport: cannot retry") {
+		return "http2_retry_body_unavailable"
+	}
+
+	return "upstream_error"
+}
+
+func prepareUpstreamBody(req *http.Request) (io.ReadCloser, func() (io.ReadCloser, error), bool, int64, error) {
+	if req.Body == nil || req.Body == http.NoBody {
+		return http.NoBody, nil, false, 0, nil
+	}
+	if req.ContentLength > maxReplayBodyBytes {
+		return req.Body, nil, false, req.ContentLength, nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(req.Body, maxReplayBodyBytes+1))
+	if err != nil {
+		return nil, nil, false, 0, err
+	}
+
+	if int64(len(body)) <= maxReplayBodyBytes {
+		if err := req.Body.Close(); err != nil {
+			return nil, nil, false, 0, err
+		}
+		getBody := func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+		return io.NopCloser(bytes.NewReader(body)), getBody, true, int64(len(body)), nil
+	}
+
+	return &readCloser{
+		Reader: io.MultiReader(bytes.NewReader(body), req.Body),
+		closer: req.Body,
+	}, nil, false, req.ContentLength, nil
 }
 
 // Proxy 封装具体的转发逻辑
@@ -55,7 +263,7 @@ func (p *Proxy) HandleProtocol(c *gin.Context) {
 }
 
 func (p *Proxy) writeError(c *gin.Context, code int, err error) {
-	c.JSON(code, gin.H{"error": err.Error(), "req_id": middleware.GetReqID(c)})
+	c.JSON(code, gin.H{"error": err.Error(), "req_id": middleware.GetReqID(c), "source": "anyproxy"})
 }
 
 func (p *Proxy) forward(c *gin.Context, target string) {
@@ -69,14 +277,29 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		"uri", c.Request.RequestURI,
 	)
 
+	trace := newUpstreamTrace()
+	ctx := httptrace.WithClientTrace(c.Request.Context(), trace.clientTrace())
+
+	body, getBody, bodyReplayable, contentLength, err := prepareUpstreamBody(c.Request)
+	if err != nil {
+		p.Log.Error("读取请求体失败", "req_id", reqID, "error", err)
+		p.writeError(c, http.StatusBadRequest, errors.New("读取请求体失败"))
+		return
+	}
+
 	// 基于原始上下文创建上游请求（支持客户端断开时取消）
-	upReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, target, c.Request.Body)
+	upReq, err := http.NewRequestWithContext(ctx, c.Request.Method, target, body)
 	if err != nil {
 		p.Log.Error("创建上游请求失败", "req_id", reqID, "error", err)
 		p.writeError(c, http.StatusInternalServerError, errors.New("创建上游请求失败"))
 		return
 	}
+	upReq.GetBody = getBody
+	if getBody != nil {
+		upReq.ContentLength = contentLength
+	}
 	upReq.Header = c.Request.Header.Clone()
+	removeHopByHopHeaders(upReq.Header)
 	if strings.Contains(strings.ToLower(c.GetHeader("Accept")), "text/event-stream") {
 		// SSE 禁用压缩
 		upReq.Header.Del("Accept-Encoding")
@@ -84,7 +307,18 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 
 	resp, err := p.Client.Do(upReq)
 	if err != nil {
-		p.Log.Error("上游请求失败", "req_id", reqID, "error", err)
+		attrs := []any{
+			"req_id", reqID,
+			"method", c.Request.Method,
+			"upstream_scheme", upReq.URL.Scheme,
+			"upstream_host", upReq.URL.Host,
+			"body_replayable", bodyReplayable,
+			"phase", trace.phase(),
+			"category", classifyUpstreamError(c.Request.Context(), err),
+			"error", err,
+		}
+		attrs = append(attrs, trace.attrs()...)
+		p.Log.Error("上游请求失败", attrs...)
 		p.writeError(c, http.StatusBadGateway, errors.New("上游请求失败"))
 		return
 	}
@@ -96,11 +330,20 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	isSSE := strings.HasPrefix(contentType, "text/event-stream")
 
-	p.Log.Debug("上游响应", "req_id", reqID, "status", resp.StatusCode, "sse", isSSE)
+	attrs := []any{"req_id", reqID, "status", resp.StatusCode, "sse", isSSE}
+	attrs = append(attrs, trace.attrs()...)
+	if resp.StatusCode >= http.StatusInternalServerError {
+		p.Log.Warn("上游返回错误状态", attrs...)
+	} else {
+		p.Log.Debug("上游响应", attrs...)
+	}
 
 	// 复制上游响应头
 	dstHeader := c.Writer.Header()
-	for k, vs := range resp.Header { dstHeader[k] = vs }
+	for k, vs := range resp.Header {
+		dstHeader[k] = vs
+	}
+	removeHopByHopHeaders(dstHeader)
 	if isSSE {
 		c.Writer.Header().Del("Content-Length")
 		c.Writer.Header().Del("Transfer-Encoding")
@@ -110,7 +353,9 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 		c.Header("X-Accel-Buffering", "no")
 	}
 	c.Status(resp.StatusCode)
-	if f, ok := c.Writer.(http.Flusher); ok { f.Flush() }
+	if f, ok := c.Writer.(http.Flusher); ok {
+		f.Flush()
+	}
 
 	if !isSSE {
 		buf := copyBufPool.Get().([]byte)
@@ -132,7 +377,9 @@ func (p *Proxy) forward(c *gin.Context, target string) {
 				p.Log.Warn("SSE写入失败", "req_id", reqID, "error", werr)
 				return
 			}
-			if flusher != nil { flusher.Flush() }
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -153,7 +400,9 @@ func HelloPage(c *gin.Context) {
 
 	// 推断外部可见协议与主机（支持反向代理常见头）
 	scheme := "http"
-	if c.Request.TLS != nil { scheme = "https" }
+	if c.Request.TLS != nil {
+		scheme = "https"
+	}
 	if xf := c.GetHeader("X-Forwarded-Proto"); xf != "" {
 		// 取第一个
 		scheme = strings.TrimSpace(strings.Split(xf, ",")[0])

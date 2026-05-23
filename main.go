@@ -41,14 +41,20 @@ func main() {
 	var writer io.Writer = os.Stderr
 	if cfg.LogFile != "" {
 		f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil { panic(err) }
+		if err != nil {
+			panic(err)
+		}
 		writer = io.MultiWriter(os.Stderr, f)
 	}
 	h := tint.NewHandler(writer, &tint.Options{AddSource: true, Level: levelVar, TimeFormat: "2006-01-02 15:04:05"})
 	logger := slog.New(h)
 	slog.SetDefault(logger)
 
-	if cfg.Debug || lvlStr == "debug" { gin.SetMode(gin.DebugMode) } else { gin.SetMode(gin.ReleaseMode) }
+	if cfg.Debug || lvlStr == "debug" {
+		gin.SetMode(gin.DebugMode)
+	} else {
+		gin.SetMode(gin.ReleaseMode)
+	}
 
 	// 可复用的 HTTP 客户端
 	transport := &http.Transport{
@@ -61,22 +67,30 @@ func main() {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	client := &http.Client{Transport: transport}
-	if cfg.RequestTimeout > 0 { client.Timeout = time.Duration(cfg.RequestTimeout) * time.Second }
+	if cfg.RequestTimeout > 0 {
+		client.Timeout = time.Duration(cfg.RequestTimeout) * time.Second
+	}
 
 	p := proxy.New(client, logger)
 
 	r := gin.New()
 	r.Use(middleware.Recovery(logger), middleware.RequestID(), middleware.Logger(logger))
 
-	r.GET("/", proxy.HelloPage) // 欢迎页面
-	r.GET("/metrics", middleware.MetricsHandler) // 指标接口
-	r.Any("/proxy/*proxyPath", p.HandleProxyPath) // 处理 /proxy/*path 形式的请求
+	r.GET("/", proxy.HelloPage)                     // 欢迎页面
+	r.GET("/metrics", middleware.MetricsHandler)    // 指标接口
+	r.Any("/proxy/*proxyPath", p.HandleProxyPath)   // 处理 /proxy/*path 形式的请求
 	r.Any(":protocol/*remainder", p.HandleProtocol) // 处理 /:protocol/*remainder 形式的请求
 
 	logger.Info("服务器启动", "addr", cfg.Addr(), "debug", cfg.Debug, "log_level", lvlStr, "version", version.Version, "commit", version.GitCommit)
 
 	// 优雅停机设置：监听系统信号，执行平滑关闭
-	srv := &http.Server{Addr: cfg.Addr(), Handler: r}
+	srv := &http.Server{
+		Addr:              cfg.Addr(),
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("服务器监听错误", "error", err)

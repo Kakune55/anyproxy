@@ -16,7 +16,6 @@ func MetricsHandler(c *gin.Context) {
 		"qps_current": qps,
 		"qps_avg_60s": float64(qpm) / 60.0,
 		"qpm_current": qpm,
-		"qpm_avg_60m": float64(qpm),
 		"total":       metrics.Total(),
 		"timestamp":   time.Now().Unix(),
 	})
